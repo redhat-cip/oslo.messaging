@@ -117,7 +117,6 @@ class MessageHandlingServer(object):
             listener = self.dispatcher._listen(self.transport)
         except driver_base.TransportDriverError as ex:
             raise ServerListenError(self.target, ex)
-
         self._executor = self._executor_cls(self.conf, listener,
                                             self.dispatcher)
         self._executor.start()
