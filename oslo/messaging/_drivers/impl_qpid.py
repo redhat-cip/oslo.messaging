@@ -24,6 +24,7 @@ import six
 from oslo.messaging._drivers import amqp as rpc_amqp
 from oslo.messaging._drivers import amqpdriver
 from oslo.messaging._drivers import common as rpc_common
+from oslo.messaging import exceptions
 from oslo.messaging.openstack.common import importutils
 from oslo.messaging.openstack.common import jsonutils
 
@@ -480,7 +481,7 @@ class Connection(object):
 
         self.username = params['username']
         self.password = params['password']
-        self.reconnect()
+        self.reconnect(retry=self.conf.transport_connection_retries)
 
     def connection_create(self, broker):
         # Create the connection - this does not open the connection
@@ -504,24 +505,48 @@ class Connection(object):
     def _lookup_consumer(self, receiver):
         return self.consumers[str(receiver)]
 
-    def reconnect(self):
-        """Handles reconnecting and re-establishing sessions and queues."""
-        delay = 1
-        while True:
-            # Close the session if necessary
-            if self.connection is not None and self.connection.opened():
-                try:
-                    self.connection.close()
-                except qpid_exceptions.ConnectionError:
-                    pass
+    def _disconnect(self):
+        # Close the session if necessary
+        if self.connection is not None and self.connection.opened():
+            try:
+                self.connection.close()
+            except qpid_exceptions.ConnectionError:
+                pass
+        self.connection = None
 
+    def reconnect(self, retry=0):
+        """Handles reconnecting and re-establishing sessions and queues.
+        Will retry up to retry number of times.
+        retry = 0 means to retry forever.
+        retry = None means no retry.
+        """
+        delay = 1
+        attempt = 0
+        if retry and retry < 0:
+            retry = 0
+
+        while True:
+            self._disconnect()
+
+            attempt += 1
             broker = self.brokers[next(self.next_broker_indices)]
 
             try:
                 self.connection_create(broker)
                 self.connection.open()
             except qpid_exceptions.ConnectionError as e:
-                msg_dict = dict(e=e, delay=delay)
+                msg_dict = dict(e=e,
+                                delay=delay,
+                                retry=retry or 0,
+                                brokers=self.brokers)
+
+                if retry is None or attempt == retry != 0:
+                    msg = _('Unable to connect to AMQP server on '
+                            '%(brokers)s after %(retry)d '
+                            'tries: %(e)s') % msg_dict
+                    LOG.error(msg)
+                    raise exceptions.MessagingDisconnected(msg)
+
                 msg = _("Unable to connect to AMQP server: %(e)s. "
                         "Sleeping %(delay)s seconds") % msg_dict
                 LOG.error(msg)
@@ -543,15 +568,20 @@ class Connection(object):
 
             LOG.debug(_("Re-established AMQP queues"))
 
-    def ensure(self, error_callback, method, *args, **kwargs):
+    def ensure(self, error_callback, method, retry=0, *args, **kwargs):
         while True:
+            if retry is None and not self.connection:
+                self.reconnect(retry=None)
             try:
                 return method(*args, **kwargs)
             except (qpid_exceptions.Empty,
                     qpid_exceptions.ConnectionError) as e:
                 if error_callback:
                     error_callback(e)
-                self.reconnect()
+            if retry is None:
+                self._disconnect()
+            else:
+                self.reconnect(retry=retry)
 
     def close(self):
         """Close/release this connection."""
@@ -610,7 +640,7 @@ class Connection(object):
                 raise StopIteration
             yield self.ensure(_error_callback, _consume)
 
-    def publisher_send(self, cls, topic, msg):
+    def publisher_send(self, cls, topic, msg, retry=0):
         """Send to a publisher based on the publisher class."""
 
         def _connect_error(exc):
@@ -622,7 +652,7 @@ class Connection(object):
             publisher = cls(self.conf, self.session, topic)
             publisher.send(msg)
 
-        return self.ensure(_connect_error, _publisher_send)
+        return self.ensure(_connect_error, _publisher_send, retry=retry)
 
     def declare_direct_consumer(self, topic, callback):
         """Create a 'direct' queue.
@@ -648,7 +678,7 @@ class Connection(object):
         """Send a 'direct' message."""
         self.publisher_send(DirectPublisher, msg_id, msg)
 
-    def topic_send(self, topic, msg, timeout=None):
+    def topic_send(self, topic, msg, timeout=None, retry=0):
         """Send a 'topic' message."""
         #
         # We want to create a message with attributes, e.g. a TTL. We
@@ -661,11 +691,11 @@ class Connection(object):
         # will need to be altered accordingly.
         #
         qpid_message = qpid_messaging.Message(content=msg, ttl=timeout)
-        self.publisher_send(TopicPublisher, topic, qpid_message)
+        self.publisher_send(TopicPublisher, topic, qpid_message, retry=retry)
 
-    def fanout_send(self, topic, msg):
+    def fanout_send(self, topic, msg, retry=0):
         """Send a 'fanout' message."""
-        self.publisher_send(FanoutPublisher, topic, msg)
+        self.publisher_send(FanoutPublisher, topic, msg, retry=retry)
 
     def notify_send(self, topic, msg, **kwargs):
         """Send a notify message on a topic."""

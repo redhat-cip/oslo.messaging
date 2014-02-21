@@ -17,6 +17,7 @@ import thread
 import threading
 import time
 
+import mock
 import qpid
 import testscenarios
 
@@ -665,3 +666,90 @@ _fake_session = FakeQpidSession()
 
 def get_fake_qpid_session():
     return _fake_session
+
+
+class QPidHATestCase(test_utils.BaseTestCase):
+
+    def setUp(self):
+        super(QPidHATestCase, self).setUp()
+        self.brokers = ['host1', 'host2', 'host3', 'host4', 'host5']
+        self.brokers_count = len(self.brokers)
+
+        self.conf.qpid_hosts = self.brokers
+        self.conf.qpid_username = None
+        self.conf.qpid_password = None
+
+        self.info = {'attempt': 0,
+                     'fail': False}
+
+        def connection_create(myself, broker):
+            # do as little work that is enough to pass connection attempt
+            myself.connection = mock.Mock()
+
+            expected_broker = self.brokers[self.info['attempt']
+                                           % self.brokers_count]
+            self.assertEqual(broker, expected_broker)
+
+            self.info['attempt'] += 1
+            if self.info['fail']:
+                raise qpid.messaging.exceptions.ConnectionError
+
+        # just make sure connection instantiation does not fail with an
+        # exception
+        self.stubs.Set(qpid_driver.Connection, 'connection_create',
+                       connection_create)
+
+        # starting from the first broker in the list
+        self.connection = qpid_driver.Connection(self.conf)
+        self.addCleanup(self.connection.close)
+
+        self.info['fail'] = True
+
+    def test_reconnect_order(self):
+        self.assertRaises(messaging.MessagingDisconnected,
+                          self.connection.reconnect,
+                          retry=len(self.brokers))
+        self.assertEqual(self.info['attempt'], len(self.brokers) + 1)
+
+    def test_no_reconnect(self):
+        self.assertRaises(messaging.MessagingDisconnected,
+                          self.connection.reconnect, retry=None)
+        self.assertEqual(self.info['attempt'], 2)
+
+    def test_ensure_connected_no_retry(self):
+        mock_callback = mock.Mock(
+            side_effect=qpid.messaging.exceptions.ConnectionError)
+        self.assertRaises(messaging.MessagingDisconnected,
+                          self.connection.ensure, None, mock_callback,
+                          retry=None)
+        self.assertEqual(self.info['attempt'], 2)
+        self.assertEqual(mock_callback.call_count, 1)
+
+    def test_ensure_disconnected_no_retry(self):
+        self.connection._disconnect()
+        mock_callback = mock.Mock(
+            side_effect=qpid.messaging.exceptions.ConnectionError)
+        self.assertRaises(messaging.MessagingDisconnected,
+                          self.connection.ensure, None, mock_callback,
+                          retry=None)
+        self.assertEqual(self.info['attempt'], 2)
+        self.assertEqual(mock_callback.call_count, 0)
+
+    def test_ensure_connected_one_retry(self):
+        mock_callback = mock.Mock(
+            side_effect=qpid.messaging.exceptions.ConnectionError)
+        self.assertRaises(messaging.MessagingDisconnected,
+                          self.connection.ensure, None, mock_callback,
+                          retry=1)
+        self.assertEqual(self.info['attempt'], 2)
+        self.assertEqual(mock_callback.call_count, 1)
+
+    def test_ensure_disconnected_one_retry(self):
+        self.connection._disconnect()
+        mock_callback = mock.Mock(
+            side_effect=qpid.messaging.exceptions.ConnectionError)
+        self.assertRaises(messaging.MessagingDisconnected,
+                          self.connection.ensure, None, mock_callback,
+                          retry=1)
+        self.assertEqual(self.info['attempt'], 2)
+        self.assertEqual(mock_callback.call_count, 1)

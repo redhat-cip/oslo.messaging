@@ -84,13 +84,14 @@ class _CallContext(object):
     _marker = object()
 
     def __init__(self, transport, target, serializer,
-                 timeout=None, version_cap=None):
+                 timeout=None, version_cap=None, retry=None):
         self.conf = transport.conf
 
         self.transport = transport
         self.target = target
         self.serializer = serializer
         self.timeout = timeout
+        self.retry = retry
         self.version_cap = version_cap
 
         super(_CallContext, self).__init__()
@@ -126,10 +127,14 @@ class _CallContext(object):
         msg = self._make_message(ctxt, method, kwargs)
         ctxt = self.serializer.serialize_context(ctxt)
 
+        retry = self.retry
+        if self.retry is None:
+            retry = self.conf.transport_connection_retries
+
         if self.version_cap:
             self._check_version_cap(msg.get('version'))
         try:
-            self.transport._send(self.target, ctxt, msg)
+            self.transport._send(self.target, ctxt, msg, retry=retry)
         except driver_base.TransportDriverError as ex:
             raise ClientSendError(self.target, ex)
 
@@ -142,12 +147,17 @@ class _CallContext(object):
         if self.timeout is None:
             timeout = self.conf.rpc_response_timeout
 
+        retry = self.retry
+        if self.retry is None:
+            retry = self.conf.transport_connection_retries
+
         if self.version_cap:
             self._check_version_cap(msg.get('version'))
 
         try:
             result = self.transport._send(self.target, msg_ctxt, msg,
-                                          wait_for_reply=True, timeout=timeout)
+                                          wait_for_reply=True, timeout=timeout,
+                                          retry=retry)
         except driver_base.TransportDriverError as ex:
             raise ClientSendError(self.target, ex)
         return self.serializer.deserialize_entity(ctxt, result)
@@ -156,7 +166,7 @@ class _CallContext(object):
     def _prepare(cls, base,
                  exchange=_marker, topic=_marker, namespace=_marker,
                  version=_marker, server=_marker, fanout=_marker,
-                 timeout=_marker, version_cap=_marker):
+                 timeout=_marker, version_cap=_marker, retry=_marker):
         """Prepare a method invocation context. See RPCClient.prepare()."""
         kwargs = dict(
             exchange=exchange,
@@ -171,21 +181,23 @@ class _CallContext(object):
 
         if timeout is cls._marker:
             timeout = base.timeout
+        if retry is cls._marker:
+            retry = base.retry
         if version_cap is cls._marker:
             version_cap = base.version_cap
 
         return _CallContext(base.transport, target,
                             base.serializer,
-                            timeout, version_cap)
+                            timeout, version_cap, retry)
 
     def prepare(self, exchange=_marker, topic=_marker, namespace=_marker,
                 version=_marker, server=_marker, fanout=_marker,
-                timeout=_marker, version_cap=_marker):
+                timeout=_marker, version_cap=_marker, retry=_marker):
         """Prepare a method invocation context. See RPCClient.prepare()."""
         return self._prepare(self,
                              exchange, topic, namespace,
                              version, server, fanout,
-                             timeout, version_cap)
+                             timeout, version_cap, retry)
 
 
 class RPCClient(object):
@@ -245,7 +257,7 @@ class RPCClient(object):
     """
 
     def __init__(self, transport, target,
-                 timeout=None, version_cap=None, serializer=None):
+                 timeout=None, version_cap=None, serializer=None, retry=None):
         """Construct an RPC client.
 
         :param transport: a messaging transport handle
@@ -265,6 +277,7 @@ class RPCClient(object):
         self.transport = transport
         self.target = target
         self.timeout = timeout
+        self.retry = retry
         self.version_cap = version_cap
         self.serializer = serializer or msg_serializer.NoOpSerializer()
 
@@ -274,7 +287,7 @@ class RPCClient(object):
 
     def prepare(self, exchange=_marker, topic=_marker, namespace=_marker,
                 version=_marker, server=_marker, fanout=_marker,
-                timeout=_marker, version_cap=_marker):
+                timeout=_marker, version_cap=_marker, retry=_marker):
         """Prepare a method invocation context.
 
         Use this method to override client properties for an individual method
@@ -298,13 +311,15 @@ class RPCClient(object):
         :type fanout: bool
         :param timeout: an optional default timeout (in seconds) for call()s
         :type timeout: int or float
+        :param retry: an optional default retry for call()s (0 means infinite)
+        :type retry: int
         :param version_cap: raise a RPCVersionCapError version exceeds this cap
         :type version_cap: str
         """
         return _CallContext._prepare(self,
                                      exchange, topic, namespace,
                                      version, server, fanout,
-                                     timeout, version_cap)
+                                     timeout, version_cap, retry)
 
     def cast(self, ctxt, method, **kwargs):
         """Invoke a method and return immediately.

@@ -21,6 +21,7 @@ import uuid
 
 import fixtures
 import kombu
+import mock
 import testscenarios
 
 from oslo import messaging
@@ -95,7 +96,7 @@ class TestRabbitTransportURL(test_utils.BaseTestCase):
             self._server_params.append(server_params)
             return cnx_init(cnx, conf, server_params)
 
-        def dummy_send(cnx, topic, msg, timeout=None):
+        def dummy_send(cnx, topic, msg, timeout=None, retry=None):
             pass
 
         self.stubs.Set(rabbit_driver.Connection, '__init__', record_params)
@@ -612,37 +613,80 @@ TestReplyWireFormat.generate_scenarios()
 
 class RpcKombuHATestCase(test_utils.BaseTestCase):
 
-    def test_reconnect_order(self):
-        brokers = ['host1', 'host2', 'host3', 'host4', 'host5']
-        brokers_count = len(brokers)
+    def setUp(self):
+        super(RpcKombuHATestCase, self).setUp()
+        self.brokers = ['host1', 'host2', 'host3', 'host4', 'host5']
+        self.brokers_count = len(self.brokers)
 
-        self.conf.rabbit_hosts = brokers
-        self.conf.rabbit_max_retries = 1
+        self.conf.rabbit_hosts = self.brokers
 
-        info = {'attempt': 0}
+        self.info = {'attempt': 0,
+                     'fail': False}
 
         def _connect(myself, params):
             # do as little work that is enough to pass connection attempt
             myself.connection = kombu.connection.BrokerConnection(**params)
             myself.connection_errors = myself.connection.connection_errors
 
-            expected_broker = brokers[info['attempt'] % brokers_count]
+            expected_broker = self.brokers[self.info['attempt']
+                                           % self.brokers_count]
             self.assertEqual(params['hostname'], expected_broker)
 
-            info['attempt'] += 1
+            self.info['attempt'] += 1
+            if self.info['fail']:
+                raise IOError('fake fail')
 
         # just make sure connection instantiation does not fail with an
         # exception
         self.stubs.Set(rabbit_driver.Connection, '_connect', _connect)
 
         # starting from the first broker in the list
-        connection = rabbit_driver.Connection(self.conf)
+        self.connection = rabbit_driver.Connection(self.conf)
+        self.addCleanup(self.connection.close)
 
-        # now that we have connection object, revert to the real 'connect'
-        # implementation
-        self.stubs.UnsetAll()
+        self.info['fail'] = True
 
-        for i in range(len(brokers)):
-            self.assertRaises(driver_common.RPCException, connection.reconnect)
+    def test_reconnect_order(self):
+        self.assertRaises(messaging.MessagingDisconnected,
+                          self.connection.reconnect,
+                          retry=len(self.brokers))
+        self.assertEqual(self.info['attempt'], len(self.brokers) + 1)
 
-        connection.close()
+    def test_no_reconnect(self):
+        self.assertRaises(messaging.MessagingDisconnected,
+                          self.connection.reconnect, retry=None)
+        self.assertEqual(self.info['attempt'], 2)
+
+    def test_ensure_connected_no_retry(self):
+        mock_callback = mock.Mock(side_effect=IOError)
+        self.assertRaises(messaging.MessagingDisconnected,
+                          self.connection.ensure, None, mock_callback,
+                          retry=None)
+        self.assertEqual(self.info['attempt'], 2)
+        self.assertEqual(mock_callback.call_count, 1)
+
+    def test_ensure_disconnected_no_retry(self):
+        self.connection._disconnect()
+        mock_callback = mock.Mock(side_effect=IOError)
+        self.assertRaises(messaging.MessagingDisconnected,
+                          self.connection.ensure, None, mock_callback,
+                          retry=None)
+        self.assertEqual(self.info['attempt'], 2)
+        self.assertEqual(mock_callback.call_count, 0)
+
+    def test_ensure_connected_one_retry(self):
+        mock_callback = mock.Mock(side_effect=IOError)
+        self.assertRaises(messaging.MessagingDisconnected,
+                          self.connection.ensure, None, mock_callback,
+                          retry=1)
+        self.assertEqual(self.info['attempt'], 2)
+        self.assertEqual(mock_callback.call_count, 1)
+
+    def test_ensure_disconnected_one_retry(self):
+        self.connection._disconnect()
+        mock_callback = mock.Mock(side_effect=IOError)
+        self.assertRaises(messaging.MessagingDisconnected,
+                          self.connection.ensure, None, mock_callback,
+                          retry=1)
+        self.assertEqual(self.info['attempt'], 2)
+        self.assertEqual(mock_callback.call_count, 1)

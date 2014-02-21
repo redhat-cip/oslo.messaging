@@ -50,6 +50,11 @@ _transport_opts = [
                help='The default exchange under which topics are scoped. May '
                     'be overridden by an exchange name specified in the '
                     'transport_url option.'),
+    cfg.IntOpt('transport_connection_retries',
+               default=0,
+               deprecated_opts=[cfg.DeprecatedOpt('rabbit_max_retries')],
+               help='Maximum number of transport connection retries. '
+                    'Default is 0 (infinite retry count)')
 ]
 
 
@@ -81,13 +86,14 @@ class Transport(object):
     def _require_driver_features(self, requeue=False):
         self._driver.require_features(requeue=requeue)
 
-    def _send(self, target, ctxt, message, wait_for_reply=None, timeout=None):
+    def _send(self, target, ctxt, message, wait_for_reply=None, timeout=None,
+              retry=None):
         if not target.topic:
             raise exceptions.InvalidTarget('A topic is required to send',
                                            target)
         return self._driver.send(target, ctxt, message,
                                  wait_for_reply=wait_for_reply,
-                                 timeout=timeout)
+                                 timeout=timeout, retry=retry)
 
     def _send_notification(self, target, ctxt, message, version):
         if not target.topic:

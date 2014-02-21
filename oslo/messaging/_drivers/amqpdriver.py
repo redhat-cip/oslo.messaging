@@ -358,7 +358,8 @@ class AMQPDriverBase(base.BaseDriver):
         return self._reply_q
 
     def _send(self, target, ctxt, message,
-              wait_for_reply=None, timeout=None, envelope=True):
+              wait_for_reply=None, timeout=None, envelope=True,
+              retry=0):
 
         # FIXME(markmc): remove this temporary hack
         class Context(object):
@@ -389,12 +390,12 @@ class AMQPDriverBase(base.BaseDriver):
         try:
             with self._get_connection() as conn:
                 if target.fanout:
-                    conn.fanout_send(target.topic, msg)
+                    conn.fanout_send(target.topic, msg, retry=retry)
                 else:
                     topic = target.topic
                     if target.server:
                         topic = '%s.%s' % (target.topic, target.server)
-                    conn.topic_send(topic, msg, timeout=timeout)
+                    conn.topic_send(topic, msg, timeout=timeout, retry=retry)
 
             if wait_for_reply:
                 result = self._waiter.wait(msg_id, timeout)
@@ -405,8 +406,10 @@ class AMQPDriverBase(base.BaseDriver):
             if wait_for_reply:
                 self._waiter.unlisten(msg_id)
 
-    def send(self, target, ctxt, message, wait_for_reply=None, timeout=None):
-        return self._send(target, ctxt, message, wait_for_reply, timeout)
+    def send(self, target, ctxt, message, wait_for_reply=None, timeout=None,
+             retry=0):
+        return self._send(target, ctxt, message, wait_for_reply, timeout,
+                          retry=retry)
 
     def send_notification(self, target, ctxt, message, version):
         return self._send(target, ctxt, message, envelope=(version == 2.0))

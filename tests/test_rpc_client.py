@@ -61,7 +61,7 @@ class TestCastCall(test_utils.BaseTestCase):
         self.mox.StubOutWithMock(transport, '_send')
 
         msg = dict(method='foo', args=self.args)
-        kwargs = {}
+        kwargs = {'retry': 0}
         if self.call:
             kwargs['wait_for_reply'] = True
             kwargs['timeout'] = None
@@ -202,7 +202,7 @@ class TestCastToTarget(test_utils.BaseTestCase):
             msg['namespace'] = self.expect['namespace']
         if 'version' in self.expect:
             msg['version'] = self.expect['version']
-        transport._send(expect_target, {}, msg)
+        transport._send(expect_target, {}, msg, retry=0)
 
         self.mox.ReplayAll()
 
@@ -252,13 +252,57 @@ class TestCallTimeout(test_utils.BaseTestCase):
         self.mox.StubOutWithMock(transport, '_send')
 
         msg = dict(method='foo', args={})
-        kwargs = dict(wait_for_reply=True, timeout=self.expect)
+        kwargs = dict(wait_for_reply=True, timeout=self.expect, retry=0)
         transport._send(messaging.Target(), {}, msg, **kwargs)
 
         self.mox.ReplayAll()
 
         if self.prepare is not _notset:
             client = client.prepare(timeout=self.prepare)
+        client.call({}, 'foo')
+
+
+class TestCallRetry(test_utils.BaseTestCase):
+
+    scenarios = [
+        ('all_none',
+         dict(confval=None, ctor=None, prepare=_notset, expect=None)),
+        ('confval',
+         dict(confval=21, ctor=None, prepare=_notset, expect=21)),
+        ('ctor',
+         dict(confval=None, ctor=21, prepare=_notset, expect=21)),
+        ('ctor_zero',
+         dict(confval=None, ctor=0, prepare=_notset, expect=0)),
+        ('prepare',
+         dict(confval=None, ctor=None, prepare=21, expect=21)),
+        ('prepare_override',
+         dict(confval=None, ctor=10, prepare=21, expect=21)),
+        ('prepare_zero',
+         dict(confval=None, ctor=None, prepare=0, expect=0)),
+    ]
+
+    def setUp(self):
+        super(TestCallRetry, self).setUp(conf=cfg.ConfigOpts())
+        self.conf.register_opts(rpc_client._client_opts)
+
+    def test_call_retry(self):
+        self.config(transport_connection_retries=self.confval)
+
+        transport = _FakeTransport(self.conf)
+        client = messaging.RPCClient(transport, messaging.Target(),
+                                     retry=self.ctor)
+
+        self.mox.StubOutWithMock(transport, '_send')
+
+        msg = dict(method='foo', args={})
+        kwargs = dict(wait_for_reply=True, timeout=60,
+                      retry=self.expect)
+        transport._send(messaging.Target(), {}, msg, **kwargs)
+
+        self.mox.ReplayAll()
+
+        if self.prepare is not _notset:
+            client = client.prepare(retry=self.prepare)
         client.call({}, 'foo')
 
 
@@ -295,6 +339,7 @@ class TestSerializer(test_utils.BaseTestCase):
         msg = dict(method='foo',
                    args=dict([(k, 's' + v) for k, v in self.args.items()]))
         kwargs = dict(wait_for_reply=True, timeout=None) if self.call else {}
+        kwargs['retry'] = 0
         transport._send(messaging.Target(),
                         dict(user='alice'),
                         msg,
@@ -384,7 +429,7 @@ class TestVersionCap(test_utils.BaseTestCase):
             if target.version is not None:
                 msg['version'] = target.version
 
-            kwargs = {}
+            kwargs = {'retry': 0}
             if self.call:
                 kwargs['wait_for_reply'] = True
                 kwargs['timeout'] = None
