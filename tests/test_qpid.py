@@ -61,6 +61,94 @@ def _is_qpidd_service_running():
     return qpid_running
 
 
+class TestQpidTransportURL(test_utils.BaseTestCase):
+
+    scenarios = [
+        ('none', dict(url=None,
+                      expected=[dict(host='localhost:5672',
+                                     username='',
+                                     password='')])),
+        ('empty',
+         dict(url='qpid:///',
+              expected=[dict(host='localhost:5672',
+                             username='',
+                             password='')])),
+        ('localhost',
+         dict(url='qpid://localhost/',
+              expected=[dict(host='localhost:5672',
+                             username='',
+                             password='')])),
+        ('no_creds',
+         dict(url='qpid://host/',
+              expected=[dict(host='host:5672',
+                             username='',
+                             password='')])),
+        ('no_port',
+         dict(url='qpid://user:password@host/',
+              expected=[dict(host='host:5672',
+                             username='user',
+                             password='password')])),
+        ('full_url',
+         dict(url='qpid://user:password@host:10/',
+              expected=[dict(host='host:10',
+                             username='user',
+                             password='password')])),
+        ('full_two_url',
+         dict(url='qpid://user:password@host:10,'
+              'user2:password2@host2:12/',
+              expected=[dict(host='host:10',
+                             username='user',
+                             password='password'),
+                        dict(host='host2:12',
+                             username='user2',
+                             password='password2')
+                        ]
+              )),
+
+    ]
+
+    def setUp(self):
+        super(TestQpidTransportURL, self).setUp()
+
+        self.messaging_conf.transport_driver = 'qpid'
+        self._fake_qpid = not _is_qpidd_service_running()
+        self._server_params = []
+        cnx_init = qpid_driver.Connection.__init__
+
+        def record_params(cnx, conf, url):
+            if self._fake_qpid:
+                with mock.patch('qpid.messaging.Connection') \
+                        as Connection:
+                    conn = Connection.return_value
+                    conn.session.return_value = get_fake_qpid_session()
+                    cnx_init(cnx, conf, url)
+            else:
+                cnx_init(cnx, conf, url)
+            self._server_params = cnx.brokers[:]
+
+        def dummy_send(cnx, topic, msg, timeout=None, retry=None):
+            pass
+
+        self.stubs.Set(qpid_driver.Connection, '__init__', record_params)
+        self.stubs.Set(qpid_driver.Connection, 'topic_send', dummy_send)
+
+        self._driver = messaging.get_transport(self.conf, self.url)._driver
+        self._target = messaging.Target(topic='testtopic')
+
+    def test_transport_url_listen(self):
+        self._driver.listen(self._target)
+        self.assertEqual(self._server_params, self.expected)
+
+    def test_transport_url_listen_for_notification(self):
+        self._driver.listen_for_notifications(
+            [(messaging.Target(topic='topic'), 'info')])
+        self.assertEqual(self._server_params, self.expected)
+
+    def test_transport_url_send(self):
+        self._driver.send(self._target, {}, {})
+        self.assertEqual(self._server_params, self.expected)
+
+
 class TestQpidInvalidTopologyVersion(test_utils.BaseTestCase):
     """Unit test cases to test invalid qpid topology version."""
 
@@ -661,6 +749,9 @@ class FakeQpidSession(object):
         key = slash_split[-1]
         return key.strip()
 
+    def close(self):
+        pass
+
 _fake_session = FakeQpidSession()
 
 
@@ -670,14 +761,23 @@ def get_fake_qpid_session():
 
 class QPidHATestCase(test_utils.BaseTestCase):
 
+    scenarios = [('legacy_config', dict(legacy_config=True)),
+                 ('transport_url', dict(legacy_config=False))]
+
     def setUp(self):
         super(QPidHATestCase, self).setUp()
         self.brokers = ['host1', 'host2', 'host3', 'host4', 'host5']
         self.brokers_count = len(self.brokers)
 
-        self.conf.qpid_hosts = self.brokers
-        self.conf.qpid_username = None
-        self.conf.qpid_password = None
+        self.conf.set_override('qpid_port', 5772)
+        if self.legacy_config:
+            self.conf.set_override('qpid_hosts', self.brokers)
+            self.conf.set_override('qpid_username', None)
+            self.conf.set_override('qpid_password', None)
+            url = None
+        else:
+            url = 'rabbit://%s' % ','.join(self.brokers)
+        url = messaging.TransportURL.parse(self.conf, url)
 
         self.info = {'attempt': 0,
                      'fail': False}
@@ -688,7 +788,7 @@ class QPidHATestCase(test_utils.BaseTestCase):
 
             expected_broker = self.brokers[self.info['attempt']
                                            % self.brokers_count]
-            self.assertEqual(broker, expected_broker)
+            self.assertEqual(broker['host'], '%s:5772' % expected_broker)
 
             self.info['attempt'] += 1
             if self.info['fail']:
@@ -700,7 +800,7 @@ class QPidHATestCase(test_utils.BaseTestCase):
                        connection_create)
 
         # starting from the first broker in the list
-        self.connection = qpid_driver.Connection(self.conf)
+        self.connection = qpid_driver.Connection(self.conf, url)
         self.addCleanup(self.connection.close)
 
         self.info['fail'] = True

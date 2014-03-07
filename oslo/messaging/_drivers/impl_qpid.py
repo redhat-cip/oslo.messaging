@@ -27,6 +27,7 @@ from oslo.messaging._drivers import common as rpc_common
 from oslo.messaging import exceptions
 from oslo.messaging.openstack.common import importutils
 from oslo.messaging.openstack.common import jsonutils
+from oslo.messaging.openstack.common import network_utils
 
 # FIXME(markmc): remove this
 _ = lambda s: s
@@ -449,9 +450,9 @@ class NotifyPublisher(Publisher):
 class Connection(object):
     """Connection object."""
 
-    pool = None
+    pools = {}
 
-    def __init__(self, conf, server_params=None):
+    def __init__(self, conf, url):
         if not qpid_messaging:
             raise ImportError("Failed to import qpid.messaging")
 
@@ -460,37 +461,48 @@ class Connection(object):
         self.consumers = {}
         self.conf = conf
 
-        if server_params and 'hostname' in server_params:
-            # NOTE(russellb) This enables support for cast_to_server.
-            server_params['qpid_hosts'] = [
-                '%s:%d' % (server_params['hostname'],
-                           server_params.get('port', 5672))
-            ]
+        params_list = []
+        if url.hosts:
+            for host in url.hosts:
+                if host.port is not None:
+                    port = host.port
+                else:
+                    port = self.conf.qpid_port
 
-        params = {
-            'qpid_hosts': self.conf.qpid_hosts,
-            'username': self.conf.qpid_username,
-            'password': self.conf.qpid_password,
-        }
-        params.update(server_params or {})
+                params = {
+                    'host': '%s:%d' % (host.hostname, port),
+                    'username': host.username or '',
+                    'password': host.password or '',
+                }
+                params_list.append(params)
+        else:
+            # Old configuration format
+            for adr in self.conf.qpid_hosts:
+                hostname, port = network_utils.parse_host_port(
+                    adr, default_port=self.conf.qpid_port)
 
-        self.brokers = params['qpid_hosts']
+                params = {
+                    'host': '%s:%d' % (hostname, port),
+                    'username': self.conf.qpid_username,
+                    'password': self.conf.qpid_password,
+                }
+                params_list.append(params)
+
+        self.brokers = params_list
 
         brokers_count = len(self.brokers)
         self.next_broker_indices = itertools.cycle(range(brokers_count))
 
-        self.username = params['username']
-        self.password = params['password']
         self.reconnect(retry=self.conf.transport_connection_retries)
 
     def connection_create(self, broker):
         # Create the connection - this does not open the connection
-        self.connection = qpid_messaging.Connection(broker)
+        self.connection = qpid_messaging.Connection(broker['host'])
 
         # Check if flags are set and if so set them for the connection
         # before we call open
-        self.connection.username = self.username
-        self.connection.password = self.password
+        self.connection.username = broker['username']
+        self.connection.password = broker['password']
 
         self.connection.sasl_mechanisms = self.conf.qpid_sasl_mechanisms
         # Reconnection is done by self.reconnect()
@@ -538,7 +550,7 @@ class Connection(object):
                 msg_dict = dict(e=e,
                                 delay=delay,
                                 retry=retry or 0,
-                                brokers=self.brokers)
+                                brokers=[b['host'] for b in self.brokers])
 
                 if retry is None or attempt == retry != 0:
                     msg = _('Unable to connect to AMQP server on '
@@ -553,7 +565,7 @@ class Connection(object):
                 time.sleep(delay)
                 delay = min(delay + 1, 5)
             else:
-                LOG.info(_('Connected to AMQP server on %s'), broker)
+                LOG.info(_('Connected to AMQP server on %s'), broker['host'])
                 break
 
         self.session = self.connection.session()
@@ -718,7 +730,7 @@ class QpidDriver(amqpdriver.AMQPDriverBase):
         conf.register_opts(qpid_opts)
         conf.register_opts(rpc_amqp.amqp_opts)
 
-        connection_pool = rpc_amqp.get_connection_pool(conf, Connection)
+        connection_pool = rpc_amqp.get_connection_pool(conf, url, Connection)
 
         super(QpidDriver, self).__init__(conf, url,
                                          connection_pool,

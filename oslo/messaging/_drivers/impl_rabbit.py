@@ -417,9 +417,9 @@ class NotifyPublisher(TopicPublisher):
 class Connection(object):
     """Connection object."""
 
-    pool = None
+    pools = {}
 
-    def __init__(self, conf, server_params=None):
+    def __init__(self, conf, url):
         self.consumers = []
         self.conf = conf
         self.interval_start = self.conf.rabbit_retry_interval
@@ -428,36 +428,57 @@ class Connection(object):
         self.interval_max = 30
         self.memory_transport = False
 
-        if server_params is None:
-            server_params = {}
-        # Keys to translate from server_params to kombu params
-        server_params_to_kombu_params = {'username': 'userid'}
-
         ssl_params = self._fetch_ssl_params()
+
+        if url.virtual_host is not None:
+            virtual_host = url.virtual_host
+        else:
+            virtual_host = self.conf.rabbit_virtual_host
+
         params_list = []
-        for adr in self.conf.rabbit_hosts:
-            hostname, port = network_utils.parse_host_port(
-                adr, default_port=self.conf.rabbit_port)
+        if url.hosts:
+            for host in url.hosts:
+                if host.port is not None:
+                    port = host.port
+                else:
+                    port = self.conf.rabbit_port
 
-            params = {
-                'hostname': hostname,
-                'port': port,
-                'userid': self.conf.rabbit_userid,
-                'password': self.conf.rabbit_password,
-                'login_method': self.conf.rabbit_login_method,
-                'virtual_host': self.conf.rabbit_virtual_host,
-            }
+                params = {
+                    'hostname': host.hostname,
+                    'port': port,
+                    'userid': host.username or '',
+                    'password': host.password or '',
+                    'login_method': self.conf.rabbit_login_method,
+                    'virtual_host': virtual_host
+                }
 
-            for sp_key, value in six.iteritems(server_params):
-                p_key = server_params_to_kombu_params.get(sp_key, sp_key)
-                params[p_key] = value
+                if self.conf.fake_rabbit:
+                    params['transport'] = 'memory'
+                if self.conf.rabbit_use_ssl:
+                    params['ssl'] = ssl_params
 
-            if self.conf.fake_rabbit:
-                params['transport'] = 'memory'
-            if self.conf.rabbit_use_ssl:
-                params['ssl'] = ssl_params
+                params_list.append(params)
+        else:
+            # Old configuration format
+            for adr in self.conf.rabbit_hosts:
+                hostname, port = network_utils.parse_host_port(
+                    adr, default_port=self.conf.rabbit_port)
 
-            params_list.append(params)
+                params = {
+                    'hostname': hostname,
+                    'port': port,
+                    'userid': self.conf.rabbit_userid,
+                    'password': self.conf.rabbit_password,
+                    'login_method': self.conf.rabbit_login_method,
+                    'virtual_host': virtual_host
+                }
+
+                if self.conf.fake_rabbit:
+                    params['transport'] = 'memory'
+                if self.conf.rabbit_use_ssl:
+                    params['ssl'] = ssl_params
+
+                params_list.append(params)
 
         self.params_list = params_list
 
@@ -785,7 +806,7 @@ class RabbitDriver(amqpdriver.AMQPDriverBase):
         conf.register_opts(rabbit_opts)
         conf.register_opts(rpc_amqp.amqp_opts)
 
-        connection_pool = rpc_amqp.get_connection_pool(conf, Connection)
+        connection_pool = rpc_amqp.get_connection_pool(conf, url, Connection)
 
         super(RabbitDriver, self).__init__(conf, url,
                                            connection_pool,

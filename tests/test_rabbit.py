@@ -49,38 +49,70 @@ class TestRabbitDriverLoad(test_utils.BaseTestCase):
 class TestRabbitTransportURL(test_utils.BaseTestCase):
 
     scenarios = [
-        ('none', dict(url=None, expected=None)),
+        ('none', dict(url=None,
+                      expected=[dict(hostname='localhost',
+                                     port=5672,
+                                     userid='guest',
+                                     password='guest',
+                                     virtual_host='/')])),
         ('empty',
          dict(url='rabbit:///',
-              expected=dict(virtual_host=''))),
+              expected=[dict(hostname='localhost',
+                             port=5672,
+                             userid='guest',
+                             password='guest',
+                             virtual_host='')])),
         ('localhost',
          dict(url='rabbit://localhost/',
-              expected=dict(hostname='localhost',
-                            username='',
-                            password='',
-                            virtual_host=''))),
+              expected=[dict(hostname='localhost',
+                             port=5672,
+                             userid='',
+                             password='',
+                             virtual_host='')])),
         ('virtual_host',
          dict(url='rabbit:///vhost',
-              expected=dict(virtual_host='vhost'))),
+              expected=[dict(hostname='localhost',
+                             port=5672,
+                             userid='guest',
+                             password='guest',
+                             virtual_host='vhost')])),
         ('no_creds',
          dict(url='rabbit://host/virtual_host',
-              expected=dict(hostname='host',
-                            username='',
-                            password='',
-                            virtual_host='virtual_host'))),
+              expected=[dict(hostname='host',
+                             port=5672,
+                             userid='',
+                             password='',
+                             virtual_host='virtual_host')])),
         ('no_port',
          dict(url='rabbit://user:password@host/virtual_host',
-              expected=dict(hostname='host',
-                            username='user',
-                            password='password',
-                            virtual_host='virtual_host'))),
+              expected=[dict(hostname='host',
+                             port=5672,
+                             userid='user',
+                             password='password',
+                             virtual_host='virtual_host')])),
         ('full_url',
          dict(url='rabbit://user:password@host:10/virtual_host',
-              expected=dict(hostname='host',
-                            port=10,
-                            username='user',
-                            password='password',
-                            virtual_host='virtual_host'))),
+              expected=[dict(hostname='host',
+                             port=10,
+                             userid='user',
+                             password='password',
+                             virtual_host='virtual_host')])),
+        ('full_two_url',
+         dict(url='rabbit://user:password@host:10,'
+              'user2:password2@host2:12/virtual_host',
+              expected=[dict(hostname='host',
+                             port=10,
+                             userid='user',
+                             password='password',
+                             virtual_host='virtual_host'),
+                        dict(hostname='host2',
+                             port=12,
+                             userid='user2',
+                             password='password2',
+                             virtual_host='virtual_host')
+                        ]
+              )),
+
     ]
 
     def setUp(self):
@@ -92,9 +124,13 @@ class TestRabbitTransportURL(test_utils.BaseTestCase):
         self._server_params = []
         cnx_init = rabbit_driver.Connection.__init__
 
-        def record_params(cnx, conf, server_params=None):
-            self._server_params.append(server_params)
-            return cnx_init(cnx, conf, server_params)
+        def record_params(cnx, conf, url):
+            cnx_init(cnx, conf, url)
+            for params in cnx.params_list:
+                cleaned_params = dict((k, v) for k, v in params.items()
+                                      if k not in ['transport',
+                                                   'login_method'])
+                self._server_params.append(cleaned_params)
 
         def dummy_send(cnx, topic, msg, timeout=None, retry=None):
             pass
@@ -107,16 +143,16 @@ class TestRabbitTransportURL(test_utils.BaseTestCase):
 
     def test_transport_url_listen(self):
         self._driver.listen(self._target)
-        self.assertEqual(self._server_params[0], self.expected)
+        self.assertEqual(self._server_params, self.expected)
 
     def test_transport_url_listen_for_notification(self):
         self._driver.listen_for_notifications(
             [(messaging.Target(topic='topic'), 'info')])
-        self.assertEqual(self._server_params[0], self.expected)
+        self.assertEqual(self._server_params, self.expected)
 
     def test_transport_url_send(self):
         self._driver.send(self._target, {}, {})
-        self.assertEqual(self._server_params[0], self.expected)
+        self.assertEqual(self._server_params, self.expected)
 
 
 class TestSendReceive(test_utils.BaseTestCase):
@@ -613,12 +649,20 @@ TestReplyWireFormat.generate_scenarios()
 
 class RpcKombuHATestCase(test_utils.BaseTestCase):
 
+    scenarios = [('legacy_config', dict(legacy_config=True)),
+                 ('transport_url', dict(legacy_config=False))]
+
     def setUp(self):
         super(RpcKombuHATestCase, self).setUp()
         self.brokers = ['host1', 'host2', 'host3', 'host4', 'host5']
         self.brokers_count = len(self.brokers)
 
-        self.conf.rabbit_hosts = self.brokers
+        if self.legacy_config:
+            self.conf.set_override('rabbit_hosts', self.brokers)
+            url = None
+        else:
+            url = 'rabbit://%s' % ','.join(self.brokers)
+        url = messaging.TransportURL.parse(self.conf, url)
 
         self.info = {'attempt': 0,
                      'fail': False}
@@ -641,7 +685,7 @@ class RpcKombuHATestCase(test_utils.BaseTestCase):
         self.stubs.Set(rabbit_driver.Connection, '_connect', _connect)
 
         # starting from the first broker in the list
-        self.connection = rabbit_driver.Connection(self.conf)
+        self.connection = rabbit_driver.Connection(self.conf, url)
         self.addCleanup(self.connection.close)
 
         self.info['fail'] = True
